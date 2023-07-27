@@ -661,6 +661,14 @@ __SYSCALL(__NR_pwritev, sys_pwritev)
 __SYSCALL(__NR_rt_tgsigqueueinfo, sys_rt_tgsigqueueinfo)
 #define __NR_perf_event_open			298
 __SYSCALL(__NR_perf_event_open, sys_perf_event_open)
+#define __NR_wmsg_create				300
+__SYSCALL(__NR_wmsg_create, sys_wmsg_create)
+#define __NR_wmsg_send					301
+__SYSCALL(__NR_wmsg_send, sys_wmsg_send)
+#define __NR_wmsg_delete				302
+__SYSCALL(__NR_wmsg_delete, sys_wmsg_delete)
+#define __NR_wmsg_recv					303
+__SYSCALL(__NR_wmsg_recv, sys_wmsg_recv)
 
 #ifndef __NO_STUBS
 #define __ARCH_WANT_OLD_READDIR

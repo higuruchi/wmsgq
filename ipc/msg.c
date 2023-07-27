@@ -38,6 +38,11 @@
 #include <linux/rwsem.h>
 #include <linux/nsproxy.h>
 #include <linux/ipc_namespace.h>
+#include <linux/file.h>
+#include <linux/fs.h>
+#include <linux/fdtable.h>
+#include <linux/spinlock.h>
+#include <linux/semaphore.h>
 
 #include <asm/current.h>
 #include <asm/uaccess.h>
@@ -942,3 +947,238 @@ static int sysvipc_msg_proc_show(struct seq_file *s, void *it)
 			msq->q_ctime);
 }
 #endif
+
+struct wmsg_msg {
+	struct list_head m_list;
+	int m_weight;
+	size_t m_size;
+	void *m_data;
+};
+
+struct wmsg_queue {
+	struct list_head wq_messages;
+	struct semaphore wq_sem;
+	int wq_count;
+};
+
+static struct wmsg_queue *alloc_wmsg_queue()
+{
+	struct wmsg_queue *wmq;
+
+	wmq = kmalloc(sizeof(struct wmsg_queue), GFP_KERNEL);
+	if (!wmq) {
+		return NULL;
+	}
+	wmq->wq_count = 0;
+	INIT_LIST_HEAD(&wmq->wq_messages);
+	init_MUTEX(&wmq->wq_sem);
+
+	return wmq;
+}
+
+static void delete_wmsg_msg(struct wmsg_msg *msg)
+{
+	kfree(msg->m_data);
+	kfree(msg);
+}
+
+static void delete_all_wmsg_msg(struct wmsg_queue *wmq)
+{
+	struct list_head *msg_head = &wmq->wq_messages, *pos;
+
+	while (list_empty(msg_head)) {
+		delete_wmsg_msg(list_entry(msg_head->next, struct wmsg_msg, m_list));
+	}
+}
+
+static int wmsg_release_file (struct inode * inode, struct file * filp)
+{
+	struct wmsg_queue *wmq;
+	int retval;
+
+	wmq = (struct wmsg_queue *)filp->private_data;
+	delete_all_wmsg_msg(wmq);
+	kfree(wmq);
+
+	return 0;
+}
+
+const struct file_operations wmsg_file_operations = {
+	.release = wmsg_release_file,
+};
+
+static unsigned int do_wmsg_create()
+{
+	unsigned int fd = get_unused_fd();
+	struct file *filp = NULL;
+	struct wmsg_queue *wmq;
+
+	if (fd > 0) {
+		filp = get_empty_filp();
+		if (!filp) {
+			put_unused_fd(fd);
+			return -1;
+		}
+
+		filp->f_op = &wmsg_file_operations;
+		wmq = alloc_wmsg_queue();
+		if (!wmq) {
+			put_unused_fd(fd);
+			fput(filp);
+			return -1;
+		}
+
+		filp->private_data = (void *)wmq;
+		fd_install(fd, filp);
+	}
+
+	return fd;
+}
+
+SYSCALL_DEFINE0(wmsg_create)
+{
+	return do_wmsg_create();
+}
+
+static void __put_unused_fd(struct files_struct *files, unsigned int fd)
+{
+	struct fdtable *fdt = files_fdtable(files);
+	if (fd < files->next_fd)
+		files->next_fd = fd;
+}
+
+SYSCALL_DEFINE1(wmsg_delete, unsigned int, fd)
+{
+	struct file * filp;
+	struct files_struct *files = current->files;
+	struct fdtable *fdt;
+	struct wmsg_queue *wmq;
+	int retval;
+
+	spin_lock(&files->file_lock);
+
+	fdt = files_fdtable(files);
+	if (fd >= fdt->max_fds)
+		goto out_unlock;
+
+	filp = fdt->fd[fd];
+	if (!filp)
+		goto out_unlock;
+
+	__put_unused_fd(files, fd);
+	spin_unlock(&files->file_lock);
+
+	wmq = (struct wmsg_queue *)filp->private_data;
+	delete_all_wmsg_msg(wmq);
+	kfree(wmq);
+	fput(filp);
+
+	return 0;
+
+out_unlock:
+	spin_unlock(&files->file_lock);
+	return -EBADF;
+}
+
+static struct wmsg_msg *alloc_wmsg_msg(const void __user *src, size_t size, int weight)
+{
+	struct wmsg_msg *msg;
+	void *data;
+
+	msg = kmalloc(sizeof(struct wmsg_msg), GFP_KERNEL);
+	if (!msg)
+		return NULL;
+	
+	data = kmalloc(size, GFP_KERNEL);
+	if (!data) {
+		kfree(msg);
+		return NULL;
+	}
+	
+	msg->m_size = size;
+	msg->m_weight = weight;
+	copy_from_user(data, src, size);
+	msg->m_data = data;
+
+	return msg;
+}
+
+static int do_wmsg_send(unsigned int fd, const void __user *src, size_t size, int weight)
+{
+	struct wmsg_queue *wmq;
+	struct wmsg_msg *new_msg, *msg_pos;
+	struct list_head *list_pos;
+	struct file *filp;
+	int fput_needed;
+
+	filp = fget_light(fd, &fput_needed);
+	if (!filp)
+		return -1;
+
+	wmq = (struct wmsg_queue *)filp->private_data;
+
+	down(&wmq->wq_sem);
+	new_msg = alloc_wmsg_msg(src, size, weight);
+	if (!new_msg) {
+		up(&wmq->wq_sem);
+		fput_light(filp, fput_needed);
+		return -1;
+	}
+
+	__list_for_each(list_pos, &wmq->wq_messages) {
+		msg_pos = list_entry(list_pos, struct wmsg_msg, m_list);
+		if (new_msg->m_weight < msg_pos->m_weight) {
+			break;
+		}
+	}
+	__list_add(&new_msg->m_list, list_pos->prev, list_pos);
+
+	wmq->wq_count += 1;
+	up(&wmq->wq_sem);
+
+	return wmq->wq_count;
+}
+
+// TODO: 引数を構造体にまとめる
+SYSCALL_DEFINE4(wmsg_send, unsigned int, fd, void __user *, data, size_t, size, int, weight)
+{
+	return do_wmsg_send(fd, data, size, weight);
+}
+
+static int do_wmsg_recv(unsigned int fd, void __user *data, size_t size)
+{
+	struct file *filp;
+	int fput_needed;
+	struct wmsg_queue *wmq;
+	struct wmsg_msg *msg;
+
+	filp = fget_light(fd, &fput_needed);
+	if (!filp)
+		return -1;
+
+	wmq = (struct wmsg_queue *)filp->private_data;
+
+repeat:
+	down(&wmq->wq_sem);
+	if (wmq->wq_count == 0) {
+		up(&wmq->wq_sem);
+		goto repeat;
+	}
+
+	msg = list_entry(wmq->wq_messages.next, struct wmsg_msg, m_list);
+	list_del(&msg->m_list);
+	copy_to_user(data, msg->m_data, size);
+
+	delete_wmsg_msg(msg);
+	wmq->wq_count -= 1;
+
+	up(&wmq->wq_sem);
+
+	return wmq->wq_count;
+}
+
+SYSCALL_DEFINE3(wmsg_recv, unsigned int, fd, void __user *, data, size_t, size)
+{
+	return do_wmsg_recv(fd, data, size);
+}
+
